@@ -4,8 +4,23 @@ output "alb_dns_name" {
 }
 
 output "phpmyadmin_url" {
-  description = "URL to reach phpMyAdmin."
-  value       = "http://${module.alb.dns_name}/"
+  description = "URL to reach phpMyAdmin. The load balancer is internal, so this resolves only from inside the VPC or over VPN."
+  value       = "https://${var.domain_name}/"
+}
+
+output "acm_certificate_arn" {
+  description = "ARN of the certificate presented by the load balancer."
+  value       = local.certificate_arn
+}
+
+output "acm_certificate_validation_records" {
+  description = "DNS records that must be published in the appevolve.intuitive.ai zone for the certificate to issue."
+  value       = var.certificate_arn == "" ? aws_acm_certificate.this[0].domain_validation_options : toset([])
+}
+
+output "vpc_endpoint_ids" {
+  description = "IDs of the VPC endpoints the tasks use in place of internet egress."
+  value       = module.vpc_endpoints.endpoints
 }
 
 output "vpc_id" {

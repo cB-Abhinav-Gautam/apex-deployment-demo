@@ -19,9 +19,33 @@ variable "tags" {
 }
 
 variable "container_image" {
-  description = "Container image for phpMyAdmin. Switch to the ECR repository URL once an image has been pushed."
+  description = "Container image for phpMyAdmin. Leave empty to use the ECR repository created by this stack. The tasks have no internet egress, so a Docker Hub reference will not pull - mirror the image into ECR first."
   type        = string
-  default     = "phpmyadmin:5.2-apache"
+  default     = ""
+}
+
+variable "image_tag" {
+  description = "Image tag to deploy from the ECR repository when container_image is empty."
+  type        = string
+  default     = "latest"
+}
+
+variable "domain_name" {
+  description = "Fully qualified domain name served by the load balancer. Used for the ACM certificate when certificate_arn is empty."
+  type        = string
+  default     = "appevolve.intuitive.ai"
+}
+
+variable "certificate_arn" {
+  description = "ARN of an existing ACM certificate. Leave empty to create one for domain_name."
+  type        = string
+  default     = ""
+}
+
+variable "allowed_cidr_blocks" {
+  description = "CIDR blocks permitted to reach the internal load balancer. Defaults to the VPC itself; widen to your VPN or peered ranges as needed."
+  type        = list(string)
+  default     = ["10.0.0.0/16"]
 }
 
 variable "task_cpu" {

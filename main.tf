@@ -12,11 +12,17 @@ locals {
   azs      = slice(data.aws_availability_zones.available.names, 0, 2)
 
   log_group_name = "/ecs/${local.name}/phpmyadmin"
+
+  certificate_arn = var.certificate_arn != "" ? var.certificate_arn : aws_acm_certificate.this[0].arn
+
+  # The tasks have no route to the internet, so the image must come from the
+  # ECR repository created below unless an explicit reference is supplied.
+  container_image = var.container_image != "" ? var.container_image : "${module.ecr.repository_url}:${var.image_tag}"
 }
 
 ################################################################################
 # KMS - customer managed key used for RDS storage, the RDS master user secret,
-# the ECR repository and the ECS log group.
+# the ECR repository and the CloudWatch log groups.
 ################################################################################
 
 data "aws_iam_policy_document" "kms" {
@@ -86,7 +92,32 @@ resource "aws_kms_alias" "main" {
 }
 
 ################################################################################
+# TLS certificate
+#
+# DNS validation records must be published in the appevolve.intuitive.ai zone
+# before the certificate issues; the listener cannot attach an unissued
+# certificate. The validation records are exposed as an output.
+################################################################################
+
+resource "aws_acm_certificate" "this" {
+  count = var.certificate_arn == "" ? 1 : 0
+
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = var.tags
+}
+
+################################################################################
 # Network
+#
+# No NAT gateway and no internet route from the private subnets. Everything the
+# tasks need (ECR, Secrets Manager, CloudWatch Logs, S3) is reached over VPC
+# endpoints, which is what allows the 0.0.0.0/0 egress rule to be removed.
 ################################################################################
 
 module "vpc" {
@@ -103,9 +134,7 @@ module "vpc" {
 
   create_database_subnet_group = true
 
-  # Fargate tasks run in the private subnets and need egress to pull the image.
-  enable_nat_gateway = true
-  single_nat_gateway = true
+  enable_nat_gateway = false
 
   enable_dns_hostnames = true
   enable_dns_support   = true
@@ -126,8 +155,55 @@ module "vpc" {
   tags = var.tags
 }
 
+module "vpc_endpoints" {
+  source  = "terraform-aws-modules/vpc/aws//modules/vpc-endpoints"
+  version = "5.16.0"
+
+  vpc_id             = module.vpc.vpc_id
+  security_group_ids = [module.vpc_endpoints_sg.security_group_id]
+
+  endpoints = {
+    s3 = {
+      service         = "s3"
+      service_type    = "Gateway"
+      route_table_ids = module.vpc.private_route_table_ids
+      tags            = { Name = "${local.name}-s3" }
+    }
+    ecr_api = {
+      service             = "ecr.api"
+      private_dns_enabled = true
+      subnet_ids          = module.vpc.private_subnets
+      tags                = { Name = "${local.name}-ecr-api" }
+    }
+    ecr_dkr = {
+      service             = "ecr.dkr"
+      private_dns_enabled = true
+      subnet_ids          = module.vpc.private_subnets
+      tags                = { Name = "${local.name}-ecr-dkr" }
+    }
+    secretsmanager = {
+      service             = "secretsmanager"
+      private_dns_enabled = true
+      subnet_ids          = module.vpc.private_subnets
+      tags                = { Name = "${local.name}-secretsmanager" }
+    }
+    logs = {
+      service             = "logs"
+      private_dns_enabled = true
+      subnet_ids          = module.vpc.private_subnets
+      tags                = { Name = "${local.name}-logs" }
+    }
+  }
+
+  tags = var.tags
+}
+
 ################################################################################
 # Security groups
+#
+# Dependency order is strictly alb_sg -> ecs_sg -> {rds_sg, vpc_endpoints_sg}.
+# Egress is expressed with CIDRs scoped to the VPC rather than peer security
+# groups, which keeps the graph acyclic and avoids any 0.0.0.0/0 rule.
 ################################################################################
 
 module "alb_sg" {
@@ -135,26 +211,33 @@ module "alb_sg" {
   version = "5.2.0"
 
   name        = "${local.name}-alb"
-  description = "Ingress to the phpMyAdmin load balancer"
+  description = "Internal load balancer for phpMyAdmin"
   vpc_id      = module.vpc.vpc_id
 
   ingress_with_cidr_blocks = [
     {
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      description = "HTTPS from permitted internal ranges"
+      cidr_blocks = join(",", var.allowed_cidr_blocks)
+    },
+    {
       from_port   = 80
       to_port     = 80
       protocol    = "tcp"
-      description = "HTTP from the internet"
-      cidr_blocks = "0.0.0.0/0"
+      description = "HTTP from permitted internal ranges, redirected to HTTPS"
+      cidr_blocks = join(",", var.allowed_cidr_blocks)
     },
   ]
 
-  egress_with_source_security_group_id = [
+  egress_with_cidr_blocks = [
     {
-      from_port                = 80
-      to_port                  = 80
-      protocol                 = "tcp"
-      description              = "To the phpMyAdmin tasks"
-      source_security_group_id = module.ecs_sg.security_group_id
+      from_port   = 80
+      to_port     = 80
+      protocol    = "tcp"
+      description = "To the phpMyAdmin tasks"
+      cidr_blocks = local.vpc_cidr
     },
   ]
 
@@ -179,9 +262,43 @@ module "ecs_sg" {
     },
   ]
 
-  # Egress to the internet is required to pull the container image and to
-  # reach the Secrets Manager and ECR endpoints via the NAT gateway.
-  egress_rules = ["all-all"]
+  egress_with_cidr_blocks = [
+    {
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      description = "To the ECR, Secrets Manager and CloudWatch Logs VPC endpoints"
+      cidr_blocks = local.vpc_cidr
+    },
+    {
+      from_port   = 3306
+      to_port     = 3306
+      protocol    = "tcp"
+      description = "To the MySQL instance"
+      cidr_blocks = local.vpc_cidr
+    },
+  ]
+
+  tags = var.tags
+}
+
+module "vpc_endpoints_sg" {
+  source  = "terraform-aws-modules/security-group/aws"
+  version = "5.2.0"
+
+  name        = "${local.name}-vpc-endpoints"
+  description = "Interface VPC endpoints"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress_with_source_security_group_id = [
+    {
+      from_port                = 443
+      to_port                  = 443
+      protocol                 = "tcp"
+      description              = "HTTPS from the phpMyAdmin tasks"
+      source_security_group_id = module.ecs_sg.security_group_id
+    },
+  ]
 
   tags = var.tags
 }
@@ -295,7 +412,7 @@ module "rds" {
 }
 
 ################################################################################
-# Load balancer
+# Load balancer - internal, HTTPS only
 ################################################################################
 
 module "alb" {
@@ -306,18 +423,35 @@ module "alb" {
 
   load_balancer_type = "application"
   vpc_id             = module.vpc.vpc_id
-  subnets            = module.vpc.public_subnets
-  security_groups    = [module.alb_sg.security_group_id]
 
+  # Internal: a database administration console is not exposed to the
+  # internet. Reachable over VPN or from peered networks only.
+  internal = true
+  subnets  = module.vpc.private_subnets
+
+  security_groups       = [module.alb_sg.security_group_id]
   create_security_group = false
 
   enable_deletion_protection = var.enable_deletion_protection
   drop_invalid_header_fields = true
 
   listeners = {
-    http = {
+    http_redirect = {
       port     = 80
       protocol = "HTTP"
+
+      redirect = {
+        port        = "443"
+        protocol    = "HTTPS"
+        status_code = "HTTP_301"
+      }
+    }
+
+    https = {
+      port            = 443
+      protocol        = "HTTPS"
+      ssl_policy      = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+      certificate_arn = local.certificate_arn
 
       forward = {
         target_group_key = "ecs"
@@ -408,7 +542,7 @@ module "ecs" {
 
       container_definitions = {
         phpmyadmin = {
-          image     = var.container_image
+          image     = local.container_image
           essential = true
 
           port_mappings = [
