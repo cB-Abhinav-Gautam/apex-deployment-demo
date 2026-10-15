@@ -15,9 +15,31 @@ locals {
 
   certificate_arn = var.certificate_arn != "" ? var.certificate_arn : aws_acm_certificate.this[0].arn
 
+  # The ECR repository URL is fully deterministic, so it is built from the
+  # account and region rather than read from the module output. The module
+  # output is only known after apply, which would make the ECS module's
+  # container_definitions for_each keys unknown at plan time.
+  ecr_repository_url = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com/${local.name}"
+
   # The tasks have no route to the internet, so the image must come from the
   # ECR repository created below unless an explicit reference is supplied.
-  container_image = var.container_image != "" ? var.container_image : "${module.ecr.repository_url}:${var.image_tag}"
+  container_image = var.container_image != "" ? var.container_image : "${local.ecr_repository_url}:${var.image_tag}"
+
+  # The RDS module returns these through try(), which produces an unknown of
+  # dynamic type. Feeding that into the ECS module's any-typed services
+  # variable makes the whole container_definitions map unknown at plan time
+  # and breaks its for_each. tostring() pins the type so only the value is
+  # unknown, which for_each tolerates.
+  db_address    = tostring(module.rds.db_instance_address)
+  db_port       = tostring(module.rds.db_instance_port)
+  db_secret_arn = tostring(module.rds.db_instance_master_user_secret_arn)
+
+  # Same treatment for the other module outputs consumed by the ECS service.
+  # The security-group module returns try(...) over several candidates, which
+  # is likewise a dynamically typed unknown.
+  ecs_security_group_id = tostring(module.ecs_sg.security_group_id)
+  ecs_target_group_arn  = tostring(module.alb.target_groups["ecs"].arn)
+  ecs_subnet_ids        = [for s in module.vpc.private_subnets : tostring(s)]
 }
 
 ################################################################################
@@ -520,94 +542,239 @@ module "ecs" {
     }
   }
 
-  services = {
-    phpmyadmin = {
-      cpu           = var.task_cpu
-      memory        = var.task_memory
-      desired_count = var.desired_count
+  # The cluster only. The task definition and service are declared natively
+  # below: this module routes container_definitions through
+  # try(each.value.container_definitions, {}), which collapses to a
+  # dynamically typed unknown as soon as any value inside is not known at
+  # plan time. The RDS endpoint and the AWS managed secret ARN both carry
+  # generated suffixes, so they can never be known during plan, and the
+  # module's inner for_each then fails with "Invalid for_each argument".
+  create_cloudwatch_log_group = false
 
-      subnet_ids       = module.vpc.private_subnets
-      assign_public_ip = false
+  tags = var.tags
+}
 
-      create_security_group = false
-      security_group_ids    = [module.ecs_sg.security_group_id]
+################################################################################
+# Task execution role - used by the ECS agent to pull the image and inject
+# secrets. Scoped to this stack's key and secret rather than wildcards.
+################################################################################
 
-      load_balancer = {
-        service = {
-          target_group_arn = module.alb.target_groups["ecs"].arn
-          container_name   = "phpmyadmin"
-          container_port   = 80
-        }
-      }
+data "aws_iam_policy_document" "ecs_assume" {
+  statement {
+    sid     = "ECSTasksAssumeRole"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
 
-      container_definitions = {
-        phpmyadmin = {
-          image     = local.container_image
-          essential = true
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
 
-          port_mappings = [
-            {
-              name          = "phpmyadmin"
-              containerPort = 80
-              hostPort      = 80
-              protocol      = "tcp"
-            },
-          ]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
 
-          environment = [
-            {
-              name  = "PMA_HOST"
-              value = module.rds.db_instance_address
-            },
-            {
-              name  = "PMA_PORT"
-              value = tostring(module.rds.db_instance_port)
-            },
-          ]
-
-          # Pulled at task start from the AWS managed RDS secret.
-          secrets = [
-            {
-              name      = "PMA_USER"
-              valueFrom = "${module.rds.db_instance_master_user_secret_arn}:username::"
-            },
-            {
-              name      = "PMA_PASSWORD"
-              valueFrom = "${module.rds.db_instance_master_user_secret_arn}:password::"
-            },
-          ]
-
-          readonly_root_filesystem = false
-
-          enable_cloudwatch_logging = false
-
-          log_configuration = {
-            logDriver = "awslogs"
-            options = {
-              "awslogs-region"        = var.region
-              "awslogs-group"         = aws_cloudwatch_log_group.phpmyadmin.name
-              "awslogs-stream-prefix" = "ecs"
-            }
-          }
-        }
-      }
-
-      tasks_iam_role_statements = {
-        read_db_secret = {
-          effect    = "Allow"
-          actions   = ["secretsmanager:GetSecretValue"]
-          resources = [module.rds.db_instance_master_user_secret_arn]
-        }
-        decrypt_db_secret = {
-          effect    = "Allow"
-          actions   = ["kms:Decrypt"]
-          resources = [aws_kms_key.main.arn]
-        }
-      }
-
-      tags = var.tags
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:${data.aws_partition.current.partition}:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:*"]
     }
   }
+}
+
+resource "aws_iam_role" "task_exec" {
+  name               = "${local.name}-task-exec"
+  description        = "Task execution role for ${local.name}"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "task_exec_managed" {
+  role       = aws_iam_role.task_exec.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+data "aws_iam_policy_document" "task_exec" {
+  statement {
+    sid       = "ReadDatabaseSecret"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [local.db_secret_arn]
+  }
+
+  statement {
+    sid    = "DecryptWithStackKey"
+    effect = "Allow"
+    actions = [
+      "kms:Decrypt",
+      "kms:DescribeKey",
+    ]
+    resources = [aws_kms_key.main.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "task_exec" {
+  name   = "${local.name}-task-exec"
+  role   = aws_iam_role.task_exec.id
+  policy = data.aws_iam_policy_document.task_exec.json
+}
+
+################################################################################
+# Task role - the application itself calls no AWS APIs, so it carries no
+# permissions. It exists so the task has a distinct identity from the agent.
+################################################################################
+
+resource "aws_iam_role" "task" {
+  name               = "${local.name}-task"
+  description        = "Task role for ${local.name}"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+
+  tags = var.tags
+}
+
+################################################################################
+# Task definition and service
+################################################################################
+
+resource "aws_ecs_task_definition" "phpmyadmin" {
+  family                   = local.name
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = var.task_cpu
+  memory                   = var.task_memory
+  execution_role_arn       = aws_iam_role.task_exec.arn
+  task_role_arn            = aws_iam_role.task.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "phpmyadmin"
+      image     = local.container_image
+      essential = true
+
+      portMappings = [
+        {
+          containerPort = 80
+          hostPort      = 80
+          protocol      = "tcp"
+        },
+      ]
+
+      environment = [
+        {
+          name  = "PMA_HOST"
+          value = local.db_address
+        },
+        {
+          name  = "PMA_PORT"
+          value = local.db_port
+        },
+      ]
+
+      # Injected by the agent from the AWS managed RDS secret.
+      secrets = [
+        {
+          name      = "PMA_USER"
+          valueFrom = "${local.db_secret_arn}:username::"
+        },
+        {
+          name      = "PMA_PASSWORD"
+          valueFrom = "${local.db_secret_arn}:password::"
+        },
+      ]
+
+      # The root filesystem is read only. Everything the image needs to write
+      # is mounted as a writable ephemeral volume below.
+      readonlyRootFilesystem = true
+
+      mountPoints = [
+        {
+          sourceVolume  = "tmp"
+          containerPath = "/tmp"
+          readOnly      = false
+        },
+        {
+          sourceVolume  = "sessions"
+          containerPath = "/sessions"
+          readOnly      = false
+        },
+        {
+          sourceVolume  = "apache-run"
+          containerPath = "/var/run/apache2"
+          readOnly      = false
+        },
+        {
+          sourceVolume  = "apache-lock"
+          containerPath = "/var/lock/apache2"
+          readOnly      = false
+        },
+        {
+          sourceVolume  = "pma-tmp"
+          containerPath = "/var/www/html/tmp"
+          readOnly      = false
+        },
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = local.log_group_name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "ecs"
+        }
+      }
+    },
+  ])
+
+  # Writable ephemeral volumes backing the read only root filesystem.
+  # Fargate provisions these from the task's ephemeral storage.
+  volume {
+    name = "tmp"
+  }
+
+  volume {
+    name = "sessions"
+  }
+
+  volume {
+    name = "apache-run"
+  }
+
+  volume {
+    name = "apache-lock"
+  }
+
+  volume {
+    name = "pma-tmp"
+  }
+
+  tags = var.tags
+}
+
+resource "aws_ecs_service" "phpmyadmin" {
+  name            = local.name
+  cluster         = module.ecs.cluster_id
+  task_definition = aws_ecs_task_definition.phpmyadmin.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = local.ecs_subnet_ids
+    security_groups  = [local.ecs_security_group_id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = local.ecs_target_group_arn
+    container_name   = "phpmyadmin"
+    container_port   = 80
+  }
+
+  # The target group must be attached to a listener before the service can
+  # register targets against it.
+  depends_on = [module.alb]
 
   tags = var.tags
 }
