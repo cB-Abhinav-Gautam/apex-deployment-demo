@@ -20,7 +20,10 @@ output "acm_certificate_validation_records" {
 
 output "vpc_endpoint_ids" {
   description = "IDs of the VPC endpoints the tasks use in place of internet egress."
-  value       = module.vpc_endpoints.endpoints
+  value = merge(
+    { s3 = aws_vpc_endpoint.s3.id },
+    { for k, v in aws_vpc_endpoint.interface : k => v.id },
+  )
 }
 
 output "vpc_id" {

@@ -177,47 +177,47 @@ module "vpc" {
   tags = var.tags
 }
 
-module "vpc_endpoints" {
-  source  = "terraform-aws-modules/vpc/aws//modules/vpc-endpoints"
-  version = "5.16.0"
+# The VPC endpoints are declared as native resources rather than through
+# terraform-aws-modules/vpc/aws//modules/vpc-endpoints. The Apex module
+# registry matches approved sources by exact string and cannot represent a
+# "//modules/..." submodule path, so the module form is rejected by the
+# governance stage. These resources are what that module would have created.
 
-  vpc_id             = module.vpc.vpc_id
+locals {
+  # Interface endpoints reached by the tasks over HTTPS. Key is the local
+  # name, value is the AWS service short name.
+  interface_endpoints = {
+    ecr_api        = "ecr.api"
+    ecr_dkr        = "ecr.dkr"
+    secretsmanager = "secretsmanager"
+    logs           = "logs"
+  }
+}
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = module.vpc.vpc_id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = module.vpc.private_route_table_ids
+
+  tags = merge(var.tags, { Name = "${local.name}-s3" })
+}
+
+resource "aws_vpc_endpoint" "interface" {
+  for_each = local.interface_endpoints
+
+  vpc_id            = module.vpc.vpc_id
+  service_name      = "com.amazonaws.${var.region}.${each.value}"
+  vpc_endpoint_type = "Interface"
+
+  subnet_ids         = module.vpc.private_subnets
   security_group_ids = [module.vpc_endpoints_sg.security_group_id]
 
-  endpoints = {
-    s3 = {
-      service         = "s3"
-      service_type    = "Gateway"
-      route_table_ids = module.vpc.private_route_table_ids
-      tags            = { Name = "${local.name}-s3" }
-    }
-    ecr_api = {
-      service             = "ecr.api"
-      private_dns_enabled = true
-      subnet_ids          = module.vpc.private_subnets
-      tags                = { Name = "${local.name}-ecr-api" }
-    }
-    ecr_dkr = {
-      service             = "ecr.dkr"
-      private_dns_enabled = true
-      subnet_ids          = module.vpc.private_subnets
-      tags                = { Name = "${local.name}-ecr-dkr" }
-    }
-    secretsmanager = {
-      service             = "secretsmanager"
-      private_dns_enabled = true
-      subnet_ids          = module.vpc.private_subnets
-      tags                = { Name = "${local.name}-secretsmanager" }
-    }
-    logs = {
-      service             = "logs"
-      private_dns_enabled = true
-      subnet_ids          = module.vpc.private_subnets
-      tags                = { Name = "${local.name}-logs" }
-    }
-  }
+  # Lets the tasks use the ordinary public service hostnames and have them
+  # resolve to the endpoint ENIs inside the VPC.
+  private_dns_enabled = true
 
-  tags = var.tags
+  tags = merge(var.tags, { Name = "${local.name}-${replace(each.key, "_", "-")}" })
 }
 
 ################################################################################
