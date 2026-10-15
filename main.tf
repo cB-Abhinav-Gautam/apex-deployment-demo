@@ -144,34 +144,47 @@ module "ecs_sg" {
   egress_rules = ["all-all"]
 }
 
-resource "random_password" "db_password" {
-  length           = 16
-  special          = true
-  override_special = "!#$%&*()-_=+[]{}<>:?"
-}
+data "aws_caller_identity" "current" {}
 
 resource "aws_kms_key" "secrets" {
-  description             = "KMS key for Secrets Manager"
+  description             = "CMK for the RDS managed master password and storage encryption"
   enable_key_rotation     = true
   deletion_window_in_days = 7
-  tags                    = var.tags
+
+  # A KMS key policy is always scoped to the key it is attached to, so
+  # "Resource": "*" below means "this key" - it grants nothing wider.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "EnableIAMUserPermissions"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "AllowSecretsManagerUseOfTheKey"
+        Effect    = "Allow"
+        Principal = { Service = "secretsmanager.amazonaws.com" }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+        ]
+        Resource = "*"
+      },
+    ]
+  })
+
+  tags = var.tags
 }
 
 resource "aws_kms_alias" "secrets" {
   name          = "alias/${local.name}-secrets"
   target_key_id = aws_kms_key.secrets.key_id
-}
-
-resource "aws_secretsmanager_secret" "db_password" {
-  name                    = "${local.name}-db-password"
-  recovery_window_in_days = 0
-  kms_key_id              = aws_kms_key.secrets.arn
-  tags                    = var.tags
-}
-
-resource "aws_secretsmanager_secret_version" "db_password" {
-  secret_id     = aws_secretsmanager_secret.db_password.id
-  secret_string = random_password.db_password.result
 }
 
 module "rds_sg" {
@@ -212,8 +225,11 @@ module "rds" {
 
   db_name  = "phpmyadmin"
   username = "admin"
-  password = random_password.db_password.result
   port     = 3306
+
+  # AWS owns, encrypts and automatically rotates the master password
+  manage_master_user_password   = true
+  master_user_secret_kms_key_id = aws_kms_key.secrets.arn
 
   multi_az               = false
   db_subnet_group_name   = module.vpc.database_subnet_group_name
@@ -279,7 +295,7 @@ module "ecs" {
           secrets = [
             {
               name      = "PMA_PASSWORD"
-              valueFrom = aws_secretsmanager_secret.db_password.arn
+              valueFrom = "${module.rds.db_instance_master_user_secret_arn}:password::"
             }
           ]
           log_configuration = {
@@ -324,7 +340,7 @@ module "ecs" {
       tasks_iam_role_statements = {
         secrets_manager = {
           actions   = ["secretsmanager:GetSecretValue", "kms:Decrypt"]
-          resources = [aws_secretsmanager_secret.db_password.arn, aws_kms_key.secrets.arn]
+          resources = [module.rds.db_instance_master_user_secret_arn, aws_kms_key.secrets.arn]
         }
       }
     }
